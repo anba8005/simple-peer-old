@@ -3,7 +3,6 @@ module.exports = Peer
 var debug = require('debug')('simple-peer')
 var getBrowserRTC = require('get-browser-rtc')
 var inherits = require('inherits')
-var randombytes = require('randombytes')
 var stream = require('readable-stream')
 
 var MAX_BUFFERED_AMOUNT = 64 * 1024
@@ -133,8 +132,20 @@ function Peer (opts) {
       self.addStream(stream)
     })
   }
-  self._pc.ontrack = function (event) {
-    self._onTrack(event)
+
+  if ('ontrack' in self._pc) {
+    self._pc.ontrack = function (event) {
+      self._onTrack(event)
+    }
+  } else if ('onaddstream' in self._pc) {
+    self._pc.onaddstream = function(event) {
+	  event.stream.getTracks().forEach(function (eventTrack) {
+	    self._onTrack({
+          streams: [ event.stream ],
+          track: eventTrack
+        })
+      })
+    };
   }
 
   if (self.initiator) {
@@ -290,7 +301,16 @@ Peer.prototype.addTrack = function (track, stream) {
   var submap = self._senderMap.get(track) || new Map() // nested Maps map [track, stream] to sender
   var sender = submap.get(stream)
   if (!sender) {
-    sender = self._pc.addTrack(track, stream)
+    if ('addTrack' in self._pc) {
+      sender = self._pc.addTrack(track, stream)
+    } else if ('addStream' in self._pc) {
+      self._pc.addStream(stream)
+      sender = {
+        id: randombytes(10),
+      };
+    } else {
+      self.destroy(makeError('Cannot addStream without webRTC support for addTrack or addStream.','ERR_NO_ADDTRACK_OR_ADDSTREAM'))
+    }
     submap.set(stream, sender)
     self._senderMap.set(track, submap)
     self._needsNegotiation()
@@ -343,7 +363,13 @@ Peer.prototype.removeTrack = function (track, stream) {
   }
   try {
     sender.removed = true
-    self._pc.removeTrack(sender)
+    if ('removeTrack' in self._pc) {
+      self._pc.removeTrack(sender)
+    } else if ('removeStream' in self._pc) {
+      self._pc.removeStream(stream)
+	} else {
+      self.destroy(makeError('Cannot addStream without webRTC support for addTrack or addStream.','ERR_NO_ADDTRACK_OR_ADDSTREAM'))
+	}
   } catch (err) {
     if (err.name === 'NS_ERROR_UNEXPECTED') {
       self._sendersAwaitingStable.push(sender) // HACK: Firefox must wait until (signalingState === stable) https://bugzilla.mozilla.org/show_bug.cgi?id=1133874
@@ -689,7 +715,7 @@ Peer.prototype.getStats = function (cb) {
   var self = this
 
   // Promise-based getStats() (standard)
-  if (self._pc.getStats.length === 0) {
+  if (self._pc.getStats.length === 0 || self._isReactNativeWebrtc) {
     self._pc.getStats().then(function (res) {
       var reports = []
       res.forEach(function (report) {
@@ -699,16 +725,6 @@ Peer.prototype.getStats = function (cb) {
     }, function (err) { cb(err) })
 
   // Two-parameter callback-based getStats() (deprecated, former standard)
-  } else if (self._isReactNativeWebrtc) {
-    self._pc.getStats(null, function (res) {
-      var reports = []
-      res.forEach(function (report) {
-        reports.push(flattenValues(report))
-      })
-      cb(null, reports)
-    }, function (err) { cb(err) })
-
-  // Single-parameter callback-based getStats() (non-standard)
   } else if (self._pc.getStats.length > 0) {
     self._pc.getStats(function (res) {
       // If we destroy connection in `connect` callback this code might happen to run when actual connection is already closed
@@ -1014,4 +1030,15 @@ function makeError (message, code) {
   var err = new Error(message)
   err.code = code
   return err
+}
+
+var randombytes = function(length) {
+  var result = '';
+  var characters =
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  var charactersLength = characters.length;
+  for (var i = 0; i < length; i++) {
+    result += characters.charAt(Math.floor(Math.random() * charactersLength));
+  }
+  return result;
 }
